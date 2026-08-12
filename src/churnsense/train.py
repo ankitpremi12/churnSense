@@ -47,12 +47,34 @@ CV = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 RANDOM_STATE = 42
 
 
-# ── Optuna objective functions ──────────────────────────────────────────────
+def _make_pipeline(clf, X_train: pd.DataFrame, use_smote: bool = False):
+    is_generic = "Contract" not in X_train.columns
+    if use_smote:
+        from imblearn.over_sampling import SMOTE
+        from imblearn.pipeline import Pipeline as ImbPipeline
+        from churnsense.features import ChurnFeatureEngineer, build_preprocessor, build_generic_preprocessor
+
+        preproc = build_generic_preprocessor(X_train) if is_generic else build_preprocessor()
+        steps = []
+        if not is_generic:
+            steps.append(("engineer", ChurnFeatureEngineer()))
+        steps.extend([
+            ("preprocessor", preproc),
+            ("smote", SMOTE(random_state=RANDOM_STATE)),
+            ("classifier", clf),
+        ])
+        return ImbPipeline(steps)
+    else:
+        if is_generic:
+            return build_generic_pipeline(clf, X_train)
+        else:
+            return build_pipeline(clf)
+
 
 def xgb_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> float:
-    scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
+    scale_pos = (y_train == 0).sum() / max(1, (y_train == 1).sum())
     params = {
-        "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 500),
         "max_depth": trial.suggest_int("max_depth", 3, 8),
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
         "subsample": trial.suggest_float("subsample", 0.6, 1.0),
@@ -68,28 +90,15 @@ def xgb_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> flo
         "verbosity": 0,
     }
     clf = XGBClassifier(**params)
-
-    if use_smote:
-        from imblearn.over_sampling import SMOTE
-        from imblearn.pipeline import Pipeline as ImbPipeline
-        from churnsense.features import ChurnFeatureEngineer, build_preprocessor
-        pipe = ImbPipeline([
-            ("engineer", ChurnFeatureEngineer()),
-            ("preprocessor", build_preprocessor()),
-            ("smote", SMOTE(random_state=RANDOM_STATE)),
-            ("classifier", clf),
-        ])
-    else:
-        pipe = build_pipeline(clf)
-
+    pipe = _make_pipeline(clf, X_train, use_smote)
     scores = cross_val_score(pipe, X_train, y_train, cv=CV, scoring="roc_auc", n_jobs=-1)
     return scores.mean()
 
 
 def lgbm_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> float:
-    scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
+    scale_pos = (y_train == 0).sum() / max(1, (y_train == 1).sum())
     params = {
-        "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 500),
         "max_depth": trial.suggest_int("max_depth", 3, 8),
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
         "num_leaves": trial.suggest_int("num_leaves", 20, 150),
@@ -104,14 +113,14 @@ def lgbm_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> fl
         "verbose": -1,
     }
     clf = LGBMClassifier(**params)
-    pipe = build_pipeline(clf)
+    pipe = _make_pipeline(clf, X_train, use_smote)
     scores = cross_val_score(pipe, X_train, y_train, cv=CV, scoring="roc_auc", n_jobs=-1)
     return scores.mean()
 
 
 def rf_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> float:
     params = {
-        "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300),
         "max_depth": trial.suggest_int("max_depth", 3, 20),
         "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
         "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
@@ -121,9 +130,10 @@ def rf_objective(trial: optuna.Trial, X_train, y_train, use_smote: bool) -> floa
         "n_jobs": -1,
     }
     clf = RandomForestClassifier(**params)
-    pipe = build_pipeline(clf)
+    pipe = _make_pipeline(clf, X_train, use_smote)
     scores = cross_val_score(pipe, X_train, y_train, cv=CV, scoring="roc_auc", n_jobs=-1)
     return scores.mean()
+
 
 
 
@@ -158,36 +168,44 @@ def run_study(name: str, objective_fn, X_train, y_train, n_trials: int, use_smot
 
 # ── SMOTE comparison helper ─────────────────────────────────────────────────
 
-def _compare_imbalance_strategies(X_train, y_train) -> bool:
+def _compare_imbalance_strategies(X_train: pd.DataFrame, y_train: pd.Series) -> bool:
     """
-    Runs a quick 3-fold comparison: SMOTE vs class-weight-only on XGBoost
-    with default-ish params. Returns True if SMOTE wins.
+    Runs a quick 3-fold comparison: SMOTE vs class-weight-only on XGBoost.
+    Returns True if SMOTE wins.
     """
     from imblearn.over_sampling import SMOTE
     from imblearn.pipeline import Pipeline as ImbPipeline
+    from churnsense.features import (
+        build_pipeline, build_generic_pipeline,
+        ChurnFeatureEngineer, build_preprocessor, build_generic_preprocessor
+    )
 
-    scale_pos = (y_train == 0).sum() / (y_train == 1).sum()
+    is_generic = "Contract" not in X_train.columns
+    scale_pos = (y_train == 0).sum() / max(1, (y_train == 1).sum())
     cv3 = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
 
     # Class weighting
     clf_weighted = XGBClassifier(
-        n_estimators=300, scale_pos_weight=scale_pos,
+        n_estimators=100, scale_pos_weight=scale_pos,
         random_state=RANDOM_STATE, verbosity=0, n_jobs=-1
     )
-    pipe_w = build_pipeline(clf_weighted)
+    pipe_w = build_generic_pipeline(clf_weighted, X_train) if is_generic else build_pipeline(clf_weighted)
     score_weighted = cross_val_score(pipe_w, X_train, y_train, cv=cv3, scoring="f1").mean()
 
     # SMOTE — needs imblearn pipeline to apply within each fold
-    from churnsense.features import ChurnFeatureEngineer, build_preprocessor
     clf_smote = XGBClassifier(
-        n_estimators=300, random_state=RANDOM_STATE, verbosity=0, n_jobs=-1
+        n_estimators=100, random_state=RANDOM_STATE, verbosity=0, n_jobs=-1
     )
-    smote_pipe = ImbPipeline([
-        ("engineer", ChurnFeatureEngineer()),
-        ("preprocessor", build_preprocessor()),
+    preproc = build_generic_preprocessor(X_train) if is_generic else build_preprocessor()
+    steps = []
+    if not is_generic:
+        steps.append(("engineer", ChurnFeatureEngineer()))
+    steps.extend([
+        ("preprocessor", preproc),
         ("smote", SMOTE(random_state=RANDOM_STATE)),
         ("classifier", clf_smote),
     ])
+    smote_pipe = ImbPipeline(steps)
     score_smote = cross_val_score(smote_pipe, X_train, y_train, cv=cv3, scoring="f1").mean()
 
     print(f"\n  Imbalance strategy comparison (3-fold F1):")
@@ -196,6 +214,7 @@ def _compare_imbalance_strategies(X_train, y_train) -> bool:
     use_smote = score_smote > score_weighted
     print(f"  → Using {'SMOTE' if use_smote else 'class weighting'}")
     return use_smote
+
 
 
 # ── Build final model from best params ─────────────────────────────────────
@@ -308,13 +327,14 @@ def main():
 
     metadata = {
         "winner": winner,
-        "use_smote": use_smote,
-        "is_generic": is_generic,
+        "use_smote": bool(use_smote),
+        "is_generic": bool(is_generic),
         "target_col": args.target,
         "feature_names": list(X_train.columns),
-        "cv_results": {k: {"cv_auc": v["cv_auc"]} for k, v in results.items()},
-        "best_params": results[winner]["params"],
+        "cv_results": {k: {"cv_auc": float(v["cv_auc"])} for k, v in results.items()},
+        "best_params": {k: float(v) if isinstance(v, (np.floating, np.integer)) else v for k, v in results[winner]["params"].items()},
     }
+
     meta_path = MODELS_DIR / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2))
     print(f"Metadata saved to {meta_path}")
