@@ -1,0 +1,20 @@
+services:
+  churnsense:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount trained model so you don't need to retrain inside the container
+      - ./models:/app/models:ro
+      - ./reports:/app/reports:ro
+    environment:
+      - PYTHONPATH=/app/src:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
