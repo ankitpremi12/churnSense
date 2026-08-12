@@ -142,9 +142,18 @@ def build_preprocessor() -> ColumnTransformer:
 
 
 def get_feature_names(preprocessor: ColumnTransformer) -> list[str]:
-    continuous = preprocessor.transformers_[0][2]
-    passthrough = preprocessor.transformers_[1][2]
-    return list(continuous) + list(passthrough)
+    try:
+        continuous = preprocessor.transformers_[0][2]
+        passthrough = preprocessor.transformers_[1][2]
+        return list(continuous) + list(passthrough)
+    except Exception:
+        if hasattr(preprocessor, "get_feature_names_out"):
+            try:
+                return list(preprocessor.get_feature_names_out())
+            except Exception:
+                pass
+        return [f"feature_{i}" for i in range(100)]
+
 
 
 def build_pipeline(classifier) -> Pipeline:

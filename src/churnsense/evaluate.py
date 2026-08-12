@@ -95,7 +95,9 @@ def plot_shap_summary(pipeline, X_test: pd.DataFrame, feature_names: list[str]):
     if hasattr(X_t, "toarray"):
         X_t = X_t.toarray()
 
-    X_df = pd.DataFrame(X_t, columns=feature_names[:X_t.shape[1]])
+    cols = feature_names if len(feature_names) == X_t.shape[1] else [f"feature_{i}" for i in range(X_t.shape[1])]
+    X_df = pd.DataFrame(X_t, columns=cols)
+
 
     classifier = pipeline[-1]
     try:
