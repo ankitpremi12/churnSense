@@ -200,11 +200,10 @@ def _compare_imbalance_strategies(X_train, y_train) -> bool:
 
 # ── Build final model from best params ─────────────────────────────────────
 
-def build_best_model(model_name: str, best_params: dict[str, Any], use_smote: bool):
-    scale_pos = None  # filled for XGBoost below
+def build_best_model(model_name: str, best_params: dict[str, Any], use_smote: bool, X_sample: pd.DataFrame = None):
+    is_generic = X_sample is not None and "Contract" not in X_sample.columns
 
     if model_name == "XGBoost":
-        # scale_pos_weight was set in objective — recompute on full training set
         clf = XGBClassifier(**{**best_params, "eval_metric": "logloss",
                                "random_state": RANDOM_STATE, "n_jobs": -1, "verbosity": 0})
     elif model_name == "LightGBM":
@@ -216,15 +215,23 @@ def build_best_model(model_name: str, best_params: dict[str, Any], use_smote: bo
     if use_smote:
         from imblearn.over_sampling import SMOTE
         from imblearn.pipeline import Pipeline as ImbPipeline
-        from churnsense.features import ChurnFeatureEngineer, build_preprocessor
-        pipe = ImbPipeline([
-            ("engineer", ChurnFeatureEngineer()),
-            ("preprocessor", build_preprocessor()),
+        from churnsense.features import ChurnFeatureEngineer, build_preprocessor, build_generic_preprocessor
+        
+        preproc = build_generic_preprocessor(X_sample) if is_generic else build_preprocessor()
+        steps = []
+        if not is_generic:
+            steps.append(("engineer", ChurnFeatureEngineer()))
+        steps.extend([
+            ("preprocessor", preproc),
             ("smote", SMOTE(random_state=RANDOM_STATE)),
             ("classifier", clf),
         ])
+        pipe = ImbPipeline(steps)
     else:
-        pipe = build_pipeline(clf)
+        if is_generic:
+            pipe = build_generic_pipeline(clf, X_sample)
+        else:
+            pipe = build_pipeline(clf)
 
     return pipe
 
@@ -232,42 +239,53 @@ def build_best_model(model_name: str, best_params: dict[str, Any], use_smote: bo
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--no-smote", action="store_true",
-                        help="Skip SMOTE comparison, always use class weighting")
+    parser = argparse.ArgumentParser(description="Train ChurnSense models")
+    parser.add_argument("--no-smote", action="store_true", help="Force-disable SMOTE oversampling")
+    parser.add_argument("--n-trials", type=int, default=30, help="Optuna trials per model")
+    parser.add_argument("--csv", type=str, default=None, help="Path to custom CSV dataset")
+    parser.add_argument("--target", type=str, default="Churn", help="Target column name")
     args = parser.parse_args()
 
-    print("Loading data...")
-    X_train, X_test, y_train, y_test = get_splits()
-    print(f"  Train: {len(X_train)} | Test: {len(X_test)} | "
-          f"Churn rate (train): {y_train.mean():.2%}")
+    print(f"\n{'=' * 55}")
+    print(f"  ChurnSense Model Training Pipeline")
+    if args.csv:
+        print(f"  Dataset: {args.csv} (target: {args.target})")
+    else:
+        print(f"  Dataset: Default IBM Telco Customer Churn")
+    print(f"{'=' * 55}\n")
 
-    # Decide imbalance strategy
+    X_train, X_test, y_train, y_test = get_splits(csv_path=args.csv, target_col=args.target)
+    print(f"Train set: {X_train.shape[0]} rows | Test set: {X_test.shape[0]} rows")
+    print(f"Features : {X_train.shape[1]} columns")
+
+    is_generic = "Contract" not in X_train.columns
+
+    # Determine imbalance strategy
     if args.no_smote:
         use_smote = False
-        print("\n  Skipping SMOTE comparison (--no-smote flag)")
+        print("SMOTE disabled via --no-smote flag.")
     else:
+        print("Evaluating class imbalance strategy...")
         use_smote = _compare_imbalance_strategies(X_train, y_train)
 
+    # Optuna study loop
     results = {}
+    models_to_tune = [
+        ("XGBoost", xgb_objective),
+        ("LightGBM", lgbm_objective),
+        ("RandomForest", rf_objective),
+    ]
 
-    # XGBoost
-    xgb_params, xgb_auc = run_study(
-        "XGBoost", xgb_objective, X_train, y_train, n_trials=40, use_smote=use_smote
-    )
-    results["XGBoost"] = {"params": xgb_params, "cv_auc": xgb_auc}
-
-    # LightGBM
-    lgbm_params, lgbm_auc = run_study(
-        "LightGBM", lgbm_objective, X_train, y_train, n_trials=40, use_smote=use_smote
-    )
-    results["LightGBM"] = {"params": lgbm_params, "cv_auc": lgbm_auc}
-
-    # Random Forest
-    rf_params, rf_auc = run_study(
-        "RandomForest", rf_objective, X_train, y_train, n_trials=25, use_smote=use_smote
-    )
-    results["RandomForest"] = {"params": rf_params, "cv_auc": rf_auc}
+    for name, obj in models_to_tune:
+        print(f"\nTuning {name} ({args.n_trials} trials)...")
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+        study.optimize(
+            lambda t: obj(t, X_train, y_train, use_smote),
+            n_trials=args.n_trials,
+            show_progress_bar=False,
+        )
+        print(f"  Best {name} CV AUC: {study.best_value:.4f}")
+        results[name] = {"params": study.best_params, "cv_auc": study.best_value}
 
     # Pick winner
     winner = max(results, key=lambda k: results[k]["cv_auc"])
@@ -280,7 +298,7 @@ def main():
 
     # Retrain winner on full training set
     print(f"Retraining {winner} on full training set...")
-    final_pipe = build_best_model(winner, results[winner]["params"], use_smote)
+    final_pipe = build_best_model(winner, results[winner]["params"], use_smote, X_sample=X_train)
     final_pipe.fit(X_train, y_train)
 
     # Save
@@ -291,6 +309,9 @@ def main():
     metadata = {
         "winner": winner,
         "use_smote": use_smote,
+        "is_generic": is_generic,
+        "target_col": args.target,
+        "feature_names": list(X_train.columns),
         "cv_results": {k: {"cv_auc": v["cv_auc"]} for k, v in results.items()},
         "best_params": results[winner]["params"],
     }

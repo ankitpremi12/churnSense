@@ -26,9 +26,10 @@ sys.path.insert(0, str(_project_root / "src"))
 
 from churnsense.model import ChurnModel
 from api.schemas import (
-    CustomerFeatures, PredictionResponse, BatchPredictionItem,
+    CustomerFeatures, GenericPredictionInput, PredictionResponse, BatchPredictionItem,
     FactorDetail, HealthResponse,
 )
+
 
 _model: ChurnModel | None = None
 _startup_time = time.time()
@@ -102,6 +103,21 @@ def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
     return _build_prediction_response(results[0])
+
+
+@app.post("/predict/generic", response_model=PredictionResponse, tags=["Predictions"])
+def predict_generic(
+    input_data: GenericPredictionInput,
+    threshold: float = Query(default=0.5, ge=0.0, le=1.0, description="Probability threshold"),
+):
+    model = _require_model()
+    df = pd.DataFrame([input_data.features])
+    try:
+        results = model.predict_with_explanation(df, threshold=threshold)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generic prediction failed: {e}")
+    return _build_prediction_response(results[0])
+
 
 
 @app.post("/predict/batch", tags=["Predictions"])

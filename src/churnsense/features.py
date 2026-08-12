@@ -153,3 +153,37 @@ def build_pipeline(classifier) -> Pipeline:
         ("preprocessor", build_preprocessor()),
         ("classifier", classifier),
     ])
+
+
+def build_generic_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+    num_cols = list(X.select_dtypes(include=[np.number]).columns)
+    cat_cols = list(X.select_dtypes(exclude=[np.number]).columns)
+
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import OneHotEncoder
+
+    num_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    cat_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ])
+
+    transformers = []
+    if num_cols:
+        transformers.append(("num", num_transformer, num_cols))
+    if cat_cols:
+        transformers.append(("cat", cat_transformer, cat_cols))
+
+    return ColumnTransformer(transformers=transformers)
+
+
+def build_generic_pipeline(classifier, X_sample: pd.DataFrame) -> Pipeline:
+    return Pipeline([
+        ("preprocessor", build_generic_preprocessor(X_sample)),
+        ("classifier", classifier),
+    ])
+

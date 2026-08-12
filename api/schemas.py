@@ -81,8 +81,16 @@ class BatchPredictionItem(BaseModel):
     prediction: PredictionResponse
 
 
+class GenericPredictionInput(BaseModel):
+    features: dict[str, Any] = Field(
+        ...,
+        examples=[{"age": 35, "income": 65000, "account_type": "premium", "is_active": True}]
+    )
+
+
 class HealthResponse(BaseModel):
     status: str
     model_name: str
     model_loaded: bool
     metadata: dict[str, Any]
+
